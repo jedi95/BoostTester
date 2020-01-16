@@ -3,7 +3,9 @@
 
 #include <cstdlib>
 #include <iostream>
+#include <intrin.h>
 #include "windows.h"
+#include "CPUInfo.h"
 
 using namespace std;
 
@@ -12,11 +14,150 @@ const unsigned int ARRAY_SIZE = HALF_ARRAY * 2;
 
 unsigned int* mem;
 
+typedef BOOL(WINAPI* LPFN_GLPI)(
+    PSYSTEM_LOGICAL_PROCESSOR_INFORMATION,
+    PDWORD);
+
+DWORD CountSetBits(ULONG_PTR bitMask)
+{
+    DWORD LSHIFT = sizeof(ULONG_PTR) * 8 - 1;
+    DWORD bitSetCount = 0;
+    ULONG_PTR bitTest = (ULONG_PTR)1 << LSHIFT;
+    DWORD i;
+
+    for (i = 0; i <= LSHIFT; ++i)
+    {
+        bitSetCount += ((bitMask & bitTest) ? 1 : 0);
+        bitTest /= 2;
+    }
+
+    return bitSetCount;
+}
+
+char* getCpuidVendor(char* vendor) {
+    int data[4];
+    __cpuid(data, 0);
+    *reinterpret_cast<int*>(vendor) = data[1];
+    *reinterpret_cast<int*>(vendor + 4) = data[3];
+    *reinterpret_cast<int*>(vendor + 8) = data[2];
+    vendor[12] = 0;
+    return vendor;
+}
+
+int getCpuidFamily() {
+    int data[4];
+    __cpuid(data, 1);
+    int family = ((data[0] >> 8) & 0x0F);
+    int extendedFamily = (data[0] >> 20) & 0xFF;
+    int displayFamily = (family != 0x0F) ? family : (extendedFamily + family);
+    return displayFamily;
+}
+
+CPUInfo getCPUInfo()
+{
+    LPFN_GLPI glpi;
+    BOOL done = FALSE;
+    PSYSTEM_LOGICAL_PROCESSOR_INFORMATION buffer = NULL;
+    PSYSTEM_LOGICAL_PROCESSOR_INFORMATION ptr = NULL;
+    DWORD returnLength = 0;
+    DWORD byteOffset = 0;
+    PCACHE_DESCRIPTOR Cache;
+    CPUInfo info;
+
+    info.cpuidFamily = getCpuidFamily();
+    getCpuidVendor(info.vendor);
+
+    glpi = (LPFN_GLPI)GetProcAddress(GetModuleHandle(TEXT("kernel32")), "GetLogicalProcessorInformation");
+    if (NULL == glpi)
+    {
+        cout << "GetLogicalProcessorInformation is not supported";
+        return info;
+    }
+
+    while (!done)
+    {
+        DWORD rc = glpi(buffer, &returnLength);
+        if (FALSE == rc)
+        {
+            if (GetLastError() == ERROR_INSUFFICIENT_BUFFER)
+            {
+                if (buffer)
+                {
+                    free(buffer);
+                }
+
+                buffer = (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION)malloc(returnLength);
+
+                if (NULL == buffer)
+                {
+                    cout << "Error: Allocation failure";
+                    return info;
+                }
+            }
+            else
+            {
+                cout << "Error: " << GetLastError();
+                return info;
+            }
+        }
+        else
+        {
+            done = TRUE;
+        }
+    }
+
+    ptr = buffer;
+
+    while (byteOffset + sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION) <= returnLength)
+    {
+        switch (ptr->Relationship)
+        {
+        case RelationNumaNode:
+            // Non-NUMA systems report a single record of this type.
+            info.numaNodeCount++;
+            break;
+
+        case RelationProcessorCore:
+            info.physicalCoreCount++;
+            info.logicalCoreCount += CountSetBits(ptr->ProcessorMask);
+            break;
+
+        case RelationCache:
+            Cache = &ptr->Cache;
+            if (Cache->Level == 1)
+            {
+                if (Cache->Type == CacheData) {
+                    info.L1CacheCount++;
+                }
+            }
+            else if (Cache->Level == 2)
+            {
+                info.L2CacheCount++;
+            }
+            else if (Cache->Level == 3)
+            {
+                info.L3CacheCount++;
+            }
+            break;
+
+        case RelationProcessorPackage:
+            info.packageCount++;
+            break;
+
+        default:
+            break;
+        }
+        byteOffset += sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION);
+        ptr++;
+    }
+    free(buffer);
+    return info;
+}
+
 //The goal of this function is to create a "100%" load at extremely low IPC.
 //The best way I can think of to do this is by constantly stalling waiting for data from RAM.
 int runTest(int core) {
 	//Setup
-	cout << "Running on core: " << (core / 2) << endl;
 	SetThreadAffinityMask(GetCurrentThread(), (static_cast<DWORD_PTR>(1) << core));
 
 	//Randomly jump through the array
@@ -74,18 +215,15 @@ int main()
 		mem[r] = temp;
 	}
 
-	//Get core count
-	//Hardcoded to assume SMT2. Too lazy to look up how to grab the physical core count.
-	//This works for any desktop Zen 2 except the 3500X anyway.
-	SYSTEM_INFO sysinfo;
-	GetSystemInfo(&sysinfo);
-	int numCPU = sysinfo.dwNumberOfProcessors;
+    CPUInfo info = getCPUInfo();
+    int threadsPerCore = info.getThreadsPerCore();
 
 	//This value has no actual meaning, but is required to avoid runTest() being optimized out by the compiler
 	unsigned long counter = 0;
 	//This condition will never be false. Tricking the compiler....
 	while (counter < 0xFFFFFFFFF) {
-		for (int i = 0; i < numCPU; i+=2) {
+		for (int i = 0; i < info.logicalCoreCount; i+=threadsPerCore) {
+            cout << "Running on core: " << (i / threadsPerCore) << endl;
 			counter = runTest(i);
 		}
 	}
