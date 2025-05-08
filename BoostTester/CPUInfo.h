@@ -19,4 +19,6 @@ public:
 	int getCoresPerL2() { return physicalCoreCount / L2CacheCount; }
 	int getL3PerPackage() { return L3CacheCount / packageCount; }
 	int getL3PerNUMANode() { return L3CacheCount / numaNodeCount; }
+	bool isHyperThreadingEnabled() { return (logicalCoreCount > physicalCoreCount); }
+	bool hasAsymmetricalCoreThreads() { return (isHyperThreadingEnabled() && (logicalCoreCount < physicalCoreCount * 2)); }
 };
